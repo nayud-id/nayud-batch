@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::db::DbClients;
 use crate::health::{service_health, db_health};
+use crate::middleware::CorrelationId;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +35,8 @@ pub async fn start_server(db_clients: DbClients, bind_addr: &str) -> std::io::Re
 
     web::HttpServer::new(move || {
         web::App::new()
+            .wrap(web::middleware::Logger::new("%{X-Correlation-Id}o %a %t \"%r\" %s %b %T"))
+            .wrap(CorrelationId::new())
             .state(app_state.clone())
             .configure(configure_routes)
     })

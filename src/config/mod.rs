@@ -67,14 +67,10 @@ impl DbEndpoint {
 
 fn read_env_string(prefix: &str, global_prefix: Option<&str>, name: &str, default: String) -> String {
     let specific = format!("{}_{}", prefix, name);
-    if let Ok(val) = env::var(&specific) {
-        if !val.is_empty() { return val; }
-    }
+    if let Ok(val) = env::var(&specific) { return val; }
     if let Some(gp) = global_prefix {
         let global = format!("{}_{}", gp, name);
-        if let Ok(val) = env::var(&global) {
-            if !val.is_empty() { return val; }
-        }
+        if let Ok(val) = env::var(&global) { return val; }
     }
     default
 }

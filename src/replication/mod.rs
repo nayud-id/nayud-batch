@@ -746,7 +746,7 @@ impl SyncWorker {
         if let Some(ds) = self.repl.drift_status(self.drift_rec_threshold, self.drift_bytes_threshold)? {
             let unhealthy = !ds.healthy;
             if unhealthy {
-                println!(
+                log::warn!(
                     "drift warning: pending_records={} pending_bytes={} cursor={} end={}",
                     ds.pending_records, ds.pending_bytes, ds.cursor, ds.end
                 );
@@ -762,7 +762,7 @@ impl SyncWorker {
             match self.run_once(clients).await {
                 Ok((_health, _processed)) => {}
                 Err(e) => {
-                    println!("sync worker error: {}", e.to_message());
+                    log::error!("sync worker error: {}", e.to_message());
                 }
             }
             ntex::time::sleep(Duration::from_millis(self.interval_ms)).await;
