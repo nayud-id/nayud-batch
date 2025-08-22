@@ -1,0 +1,17 @@
+[package]
+name = "nayud-batch"
+version = "1.0.0"
+rust-version = "1.89.0"
+edition = "2024"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[dependencies]
