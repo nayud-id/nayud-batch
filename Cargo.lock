@@ -713,6 +713,7 @@ dependencies = [
  "ntex",
  "scylla",
  "serde",
+ "tokio",
 ]
 
 [[package]]
