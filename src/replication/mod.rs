@@ -163,6 +163,14 @@ impl Outbox {
         Ok(u64::from_le_bytes(buf))
     }
 
+    pub fn end_offset(&self) -> AppResult<u64> {
+        std::fs::metadata(&self.log_path)
+            .map(|m| m.len())
+            .map_err(|e| AppError::other(format!("outbox metadata: {}", e)))
+    }
+
+    pub fn current_cursor(&self) -> AppResult<u64> { self.load_cursor() }
+
     pub fn store_cursor(&self, offset: u64) -> AppResult<()> {
         std::fs::write(&self.cursor_path, offset.to_le_bytes()).map_err(|e| AppError::other(format!("cursor write: {}", e)))
     }
@@ -366,6 +374,15 @@ impl FailoverManager {
 
     pub fn last_status(&self) -> (bool, bool) { (self.state.last_active_ok, self.state.last_passive_ok) }
 
+    async fn maybe_switch(&mut self, clients: &DbClients) {
+        if let Some(to) = self.state.pending() {
+            let from = self.state.primary;
+            if self.force_ready || self.sync.ready_to_switch(clients, from, to).await {
+                self.state.commit_switch(to);
+            }
+        }
+    }
+
     pub async fn tick(&mut self, clients: &DbClients) -> ApiResponse<DbHealth> {
         let resp = db_health(clients).await;
         let (a_ok, p_ok) = match &resp.data {
@@ -374,12 +391,7 @@ impl FailoverManager {
         };
         self.state.update_with(a_ok, p_ok);
 
-        if let Some(to) = self.state.pending() {
-            let from = self.state.primary;
-            if self.force_ready || self.sync.ready_to_switch(clients, from, to).await {
-                self.state.commit_switch(to);
-            }
-        }
+        self.maybe_switch(clients).await;
 
         resp
     }
@@ -387,12 +399,7 @@ impl FailoverManager {
     pub async fn tick_with_status(&mut self, clients: &DbClients, a_ok: bool, p_ok: bool) -> ApiResponse<DbHealth> {
         let resp = ApiResponse::success_with("databases healthy", DbHealth { active_ok: a_ok, passive_ok: p_ok });
         self.state.update_with(a_ok, p_ok);
-        if let Some(to) = self.state.pending() {
-            let from = self.state.primary;
-            if self.force_ready || self.sync.ready_to_switch(clients, from, to).await {
-                self.state.commit_switch(to);
-            }
-        }
+        self.maybe_switch(clients).await;
         resp
     }
 }
@@ -400,14 +407,22 @@ impl FailoverManager {
 #[derive(Debug, Default)]
 pub struct ReplicationManager {
     outbox: Option<Outbox>,
+    active_keyspace: Option<String>,
+    passive_keyspace: Option<String>,
 }
 
 impl ReplicationManager {
-    pub fn new() -> Self { Self { outbox: None } }
+    pub fn new() -> Self { Self { outbox: None, active_keyspace: None, passive_keyspace: None } }
 
     pub fn with_outbox_dir<P: AsRef<Path>>(dir: P) -> AppResult<Self> {
         let ob = Outbox::open(dir)?;
-        Ok(Self { outbox: Some(ob) })
+        Ok(Self { outbox: Some(ob), active_keyspace: None, passive_keyspace: None })
+    }
+
+    pub fn with_keyspaces(mut self, active: impl Into<String>, passive: impl Into<String>) -> Self {
+        self.active_keyspace = Some(active.into());
+        self.passive_keyspace = Some(passive.into());
+        self
     }
 
     pub fn has_outbox(&self) -> bool { self.outbox.is_some() }
@@ -426,25 +441,117 @@ impl ReplicationManager {
         }
     }
 
+    pub fn current_cursor(&self) -> AppResult<Option<u64>> {
+        match &self.outbox {
+            Some(ob) => Ok(Some(ob.current_cursor()?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn write_watermark_for(&self, sess_opt: Option<&Session>, keyspace_opt: &Option<String>, last_id: u64) -> bool {
+        if let (Some(sess), Some(ks)) = (sess_opt, keyspace_opt.as_ref()) {
+            let create = format!(
+                "CREATE TABLE IF NOT EXISTS {}.repl_watermark (id tinyint PRIMARY KEY, last_applied_log_id bigint, heartbeat_ms bigint)",
+                ks
+            );
+            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let upsert = format!(
+                "INSERT INTO {}.repl_watermark (id, last_applied_log_id, heartbeat_ms) VALUES (0, {}, {})",
+                ks, last_id, now_ms
+            );
+            let c1 = Self::exec_unpaged_session(Some(sess), &create, Consistency::One).await;
+            let c2 = Self::exec_unpaged_session(Some(sess), &upsert, Consistency::One).await;
+            c1 && c2
+        } else {
+            false
+        }
+    }
+
+    pub async fn write_watermark_cluster(&self, cluster: Cluster, last_id: u64, clients: &DbClients) -> bool {
+        match cluster {
+            Cluster::Active => self.write_watermark_for(clients.active.as_ref(), &self.active_keyspace, last_id).await,
+            Cluster::Passive => self.write_watermark_for(clients.passive.as_ref(), &self.passive_keyspace, last_id).await,
+        }
+    }
+
+    pub fn drift_status(&self, rec_threshold: usize, bytes_threshold: u64) -> AppResult<Option<DriftStatus>> {
+        match &self.outbox {
+            Some(ob) => {
+                let cursor = ob.current_cursor()?;
+                let end = ob.end_offset()?;
+                let pending_records = ob.pending_count()?;
+                let pending_bytes = end.saturating_sub(cursor);
+                let healthy = pending_records <= rec_threshold && pending_bytes <= bytes_threshold;
+                Ok(Some(DriftStatus { pending_records, pending_bytes, cursor, end, healthy }))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn replay_with<F, Fut>(&mut self, max: usize, mut apply: F) -> AppResult<usize>
     where
         F: FnMut(OutboxRecord) -> Fut,
         Fut: Future<Output = bool>,
     {
         let Some(ob) = self.outbox.as_mut() else { return Ok(0) };
-        let mut cursor = ob.load_cursor()?;
+        let cursor = ob.load_cursor()?;
         let batch = ob.read_from(cursor, max)?;
         let mut processed = 0usize;
         for (start, end, rec) in batch {
             let _ = start;
             if apply(rec).await {
                 ob.store_cursor(end)?;
-                 cursor = end;
-                 processed += 1;
-             } else {
-                 break;
-             }
+                processed += 1;
+            } else {
+                break;
+            }
         }
+        Ok(processed)
+    }
+
+    pub async fn replay_and_mark(&mut self, max: usize, clients: &DbClients) -> AppResult<usize> {
+        let mut processed = 0usize;
+        let mut marks: Vec<(Cluster, u64)> = Vec::new();
+        {
+            let Some(ob) = self.outbox.as_mut() else { return Ok(0) };
+            let cursor = ob.load_cursor()?;
+            let batch = ob.read_from(cursor, max)?;
+            for (_start, end, rec) in batch {
+                let applied_ok = match rec.target {
+                    OutboxTarget::Active => {
+                        Self::exec_unpaged_session(clients.active.as_ref(), rec.statement.as_str(), Consistency::LocalQuorum).await
+                    }
+                    OutboxTarget::Passive => {
+                        Self::exec_unpaged_session(clients.passive.as_ref(), rec.statement.as_str(), Consistency::One).await
+                    }
+                    OutboxTarget::Both => {
+                        let a = Self::exec_unpaged_session(clients.active.as_ref(), rec.statement.as_str(), Consistency::LocalQuorum).await;
+                        let b = Self::exec_unpaged_session(clients.passive.as_ref(), rec.statement.as_str(), Consistency::One).await;
+                        a && b
+                    }
+                };
+
+                if applied_ok {
+                    ob.store_cursor(end)?;
+                    match rec.target {
+                        OutboxTarget::Active => marks.push((Cluster::Active, end)),
+                        OutboxTarget::Passive => marks.push((Cluster::Passive, end)),
+                        OutboxTarget::Both => {
+                            marks.push((Cluster::Active, end));
+                            marks.push((Cluster::Passive, end));
+                        }
+                    }
+                    processed += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for (cl, id) in marks {
+            let _ = self.write_watermark_cluster(cl, id, clients).await;
+        }
+
         Ok(processed)
     }
 
@@ -559,22 +666,17 @@ impl ReplicationManager {
     }
 
     pub async fn replay_simple(&mut self, max: usize, clients: &DbClients) -> AppResult<usize> {
-        self.replay_with(max, |rec| async move {
-            match rec.target {
-                OutboxTarget::Active => {
-                    Self::exec_unpaged_session(clients.active.as_ref(), rec.statement.as_str(), Consistency::LocalQuorum).await
-                }
-                OutboxTarget::Passive => {
-                    Self::exec_unpaged_session(clients.passive.as_ref(), rec.statement.as_str(), Consistency::One).await
-                }
-                OutboxTarget::Both => {
-                    let a = Self::exec_unpaged_session(clients.active.as_ref(), rec.statement.as_str(), Consistency::LocalQuorum).await;
-                    let b = Self::exec_unpaged_session(clients.passive.as_ref(), rec.statement.as_str(), Consistency::One).await;
-                    a && b
-                }
-            }
-        }).await
+        self.replay_and_mark(max, clients).await
     }
+}
+
+#[derive(Debug)]
+pub struct DriftStatus {
+    pub pending_records: usize,
+    pub pending_bytes: u64,
+    pub cursor: u64,
+    pub end: u64,
+    pub healthy: bool,
 }
 
 #[derive(Debug)]
@@ -583,6 +685,9 @@ pub struct SyncWorker {
     failover: FailoverManager,
     interval_ms: u64,
     max_replay_per_tick: usize,
+    drift_rec_threshold: usize,
+    drift_bytes_threshold: u64,
+    last_drift: Option<DriftStatus>,
 }
 
 impl SyncWorker {
@@ -592,6 +697,9 @@ impl SyncWorker {
             failover: FailoverManager::new(),
             interval_ms: 1000,
             max_replay_per_tick: 128,
+            drift_rec_threshold: 100,
+            drift_bytes_threshold: 1_000_000,
+            last_drift: None,
         }
     }
 
@@ -604,6 +712,17 @@ impl SyncWorker {
         Ok(self)
     }
 
+    pub fn with_drift_thresholds(mut self, rec_threshold: usize, bytes_threshold: u64) -> Self {
+        self.drift_rec_threshold = rec_threshold;
+        self.drift_bytes_threshold = bytes_threshold;
+        self
+    }
+
+    pub fn with_keyspaces(mut self, active: impl Into<String>, passive: impl Into<String>) -> Self {
+        self.repl = std::mem::take(&mut self.repl).with_keyspaces(active, passive);
+        self
+    }
+
     pub fn queue_len(&self) -> usize { self.repl.queue_len() }
 
     pub fn has_outbox(&self) -> bool { self.repl.has_outbox() }
@@ -614,9 +733,27 @@ impl SyncWorker {
         if self.repl.has_outbox() && self.max_replay_per_tick > 0 {
             let to_drain = self.max_replay_per_tick.min(self.repl.queue_len());
             if to_drain > 0 {
-                processed = self.repl.replay_simple(to_drain, clients).await?;
+                processed = self.repl.replay_and_mark(to_drain, clients).await?;
             }
         }
+
+        if self.repl.has_outbox() {
+            if let Ok(Some(cur)) = self.repl.current_cursor() {
+                let _ = self.repl.write_watermark_cluster(Cluster::Passive, cur, clients).await;
+            }
+        }
+
+        if let Some(ds) = self.repl.drift_status(self.drift_rec_threshold, self.drift_bytes_threshold)? {
+            let unhealthy = !ds.healthy;
+            if unhealthy {
+                println!(
+                    "drift warning: pending_records={} pending_bytes={} cursor={} end={}",
+                    ds.pending_records, ds.pending_bytes, ds.cursor, ds.end
+                );
+            }
+            self.last_drift = Some(ds);
+        }
+
         Ok((health, processed))
     }
 
