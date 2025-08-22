@@ -10,6 +10,8 @@ use crate::errors::{AppError, AppResult};
 use crate::health::{db_health, DbHealth};
 use crate::types::ApiResponse;
 use scylla::client::session::Session;
+use scylla::statement::Consistency;
+use scylla::statement::unprepared::Statement as UnpreparedStatement;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Cluster {
@@ -433,20 +435,24 @@ impl ReplicationManager {
             match rec.target {
                 OutboxTarget::Active => {
                     if let Some(sess) = clients.active.as_ref() {
-                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                        let st = Self::build_statement(rec.statement.as_str(), Consistency::LocalQuorum);
+                        sess.query_unpaged(st, &[]).await.is_ok()
                     } else { false }
                 }
                 OutboxTarget::Passive => {
                     if let Some(sess) = clients.passive.as_ref() {
-                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                        let st = Self::build_statement(rec.statement.as_str(), Consistency::One);
+                        sess.query_unpaged(st, &[]).await.is_ok()
                     } else { false }
                 }
                 OutboxTarget::Both => {
                     let a = if let Some(sess) = clients.active.as_ref() {
-                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                        let st = Self::build_statement(rec.statement.as_str(), Consistency::LocalQuorum);
+                        sess.query_unpaged(st, &[]).await.is_ok()
                     } else { false };
                     let b = if let Some(sess) = clients.passive.as_ref() {
-                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                        let st = Self::build_statement(rec.statement.as_str(), Consistency::One);
+                        sess.query_unpaged(st, &[]).await.is_ok()
                     } else { false };
                     a && b
                 }
@@ -455,4 +461,72 @@ impl ReplicationManager {
     }
 
     pub fn tick(&mut self) {}
+
+    fn build_statement(cql: &str, consistency: Consistency) -> UnpreparedStatement {
+        let mut st = UnpreparedStatement::new(cql);
+        st.set_consistency(consistency);
+        st.set_is_idempotent(true);
+        st
+    }
+
+    pub async fn write_simple(
+        &mut self,
+        idempotency_key: impl Into<String>,
+        cql: impl Into<String>,
+        target: OutboxTarget,
+        consistency: Option<Consistency>,
+        clients: &DbClients,
+    ) -> AppResult<bool> {
+        let key = idempotency_key.into();
+        let cql = cql.into();
+        let mut any_ok = false;
+
+        match target {
+            OutboxTarget::Active => {
+                let cl = consistency.unwrap_or(Consistency::LocalQuorum);
+                let ok = if let Some(sess) = clients.active.as_ref() {
+                    let st = Self::build_statement(&cql, cl);
+                    sess.query_unpaged(st, &[]).await.is_ok()
+                } else { false };
+                if !ok {
+                    let _ = self.enqueue(OutboxRecord::new_simple(key.clone(), cql.clone(), OutboxTarget::Active));
+                }
+                any_ok |= ok;
+            }
+            OutboxTarget::Passive => {
+                let cl = consistency.unwrap_or(Consistency::One);
+                let ok = if let Some(sess) = clients.passive.as_ref() {
+                    let st = Self::build_statement(&cql, cl);
+                    sess.query_unpaged(st, &[]).await.is_ok()
+                } else { false };
+                if !ok {
+                    let _ = self.enqueue(OutboxRecord::new_simple(key.clone(), cql.clone(), OutboxTarget::Passive));
+                }
+                any_ok |= ok;
+            }
+            OutboxTarget::Both => {
+                let cl_a = consistency.unwrap_or(Consistency::LocalQuorum);
+                let ok_a = if let Some(sess) = clients.active.as_ref() {
+                    let st = Self::build_statement(&cql, cl_a);
+                    sess.query_unpaged(st, &[]).await.is_ok()
+                } else { false };
+                if !ok_a {
+                    let _ = self.enqueue(OutboxRecord::new_simple(key.clone(), cql.clone(), OutboxTarget::Active));
+                }
+                any_ok |= ok_a;
+
+                let cl_p = consistency.unwrap_or(Consistency::One);
+                let ok_p = if let Some(sess) = clients.passive.as_ref() {
+                    let st = Self::build_statement(&cql, cl_p);
+                    sess.query_unpaged(st, &[]).await.is_ok()
+                } else { false };
+                if !ok_p {
+                    let _ = self.enqueue(OutboxRecord::new_simple(key.clone(), cql.clone(), OutboxTarget::Passive));
+                }
+                any_ok |= ok_p;
+            }
+        }
+
+        Ok(any_ok)
+    }
 }
