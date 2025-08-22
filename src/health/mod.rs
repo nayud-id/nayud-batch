@@ -1,13 +1,15 @@
 use crate::types::{ApiResponse};
 use crate::db::DbClients;
-use scylla::client::session::Session;
 
-#[derive(Debug)]
+use scylla::client::session::Session;
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
 pub struct ServiceHealth {
     pub ok: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct DbHealth {
     pub active_ok: bool,
     pub passive_ok: bool,

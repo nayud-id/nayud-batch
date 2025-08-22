@@ -1,14 +1,16 @@
-pub const CODE_SUCCESS: &str = "00";
-pub const CODE_FAILURE: &str = "99";
+use serde::Serialize;
 
 use crate::errors::AppError;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ApiResponse<T> {
     pub code: &'static str,
     pub message: String,
     pub data: Option<T>,
 }
+
+pub const CODE_SUCCESS: &str = "00";
+pub const CODE_FAILURE: &str = "99";
 
 impl<T> ApiResponse<T> {
     pub fn ok(message: impl Into<String>, data: Option<T>) -> Self {
