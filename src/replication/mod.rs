@@ -339,11 +339,12 @@ impl FailoverState {
 pub struct FailoverManager {
     state: FailoverState,
     sync: DefaultSyncCheck,
+    force_ready: bool,
 }
 
 impl Default for FailoverManager {
     fn default() -> Self {
-        Self { state: FailoverState::default(), sync: DefaultSyncCheck::default() }
+        Self { state: FailoverState::default(), sync: DefaultSyncCheck::default(), force_ready: false }
     }
 }
 
@@ -354,8 +355,10 @@ impl FailoverManager {
         let mut checker = DefaultSyncCheck::default();
         checker.active_keyspace = Some(cfg.active.keyspace.clone());
         checker.passive_keyspace = Some(cfg.passive.keyspace.clone());
-        Self { state: FailoverState::default(), sync: checker }
+        Self { state: FailoverState::default(), sync: checker, force_ready: false }
     }
+
+    pub fn with_force_ready(mut self, v: bool) -> Self { self.force_ready = v; self }
 
     pub fn current_primary(&self) -> Cluster { self.state.primary }
 
@@ -373,11 +376,23 @@ impl FailoverManager {
 
         if let Some(to) = self.state.pending() {
             let from = self.state.primary;
-            if self.sync.ready_to_switch(clients, from, to).await {
+            if self.force_ready || self.sync.ready_to_switch(clients, from, to).await {
                 self.state.commit_switch(to);
             }
         }
 
+        resp
+    }
+
+    pub async fn tick_with_status(&mut self, clients: &DbClients, a_ok: bool, p_ok: bool) -> ApiResponse<DbHealth> {
+        let resp = ApiResponse::success_with("databases healthy", DbHealth { active_ok: a_ok, passive_ok: p_ok });
+        self.state.update_with(a_ok, p_ok);
+        if let Some(to) = self.state.pending() {
+            let from = self.state.primary;
+            if self.force_ready || self.sync.ready_to_switch(clients, from, to).await {
+                self.state.commit_switch(to);
+            }
+        }
         resp
     }
 }
