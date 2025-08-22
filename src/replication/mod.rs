@@ -1,4 +1,4 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH, Duration};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -578,5 +578,61 @@ impl ReplicationManager {
         }
 
         Ok(None)
+    }
+}
+
+#[derive(Debug)]
+pub struct SyncWorker {
+    repl: ReplicationManager,
+    failover: FailoverManager,
+    interval_ms: u64,
+    max_replay_per_tick: usize,
+}
+
+impl SyncWorker {
+    pub fn new() -> Self {
+        Self {
+            repl: ReplicationManager::new(),
+            failover: FailoverManager::new(),
+            interval_ms: 1000,
+            max_replay_per_tick: 128,
+        }
+    }
+
+    pub fn with_interval_ms(mut self, ms: u64) -> Self { self.interval_ms = ms; self }
+
+    pub fn with_max_replay_per_tick(mut self, max: usize) -> Self { self.max_replay_per_tick = max; self }
+
+    pub fn with_outbox_dir<P: AsRef<Path>>(mut self, dir: P) -> AppResult<Self> {
+        self.repl = ReplicationManager::with_outbox_dir(dir)?;
+        Ok(self)
+    }
+
+    pub fn queue_len(&self) -> usize { self.repl.queue_len() }
+
+    pub fn has_outbox(&self) -> bool { self.repl.has_outbox() }
+
+    pub async fn run_once(&mut self, clients: &DbClients) -> AppResult<(ApiResponse<DbHealth>, usize)> {
+        let health = self.failover.tick(clients).await;
+        let mut processed = 0usize;
+        if self.repl.has_outbox() && self.max_replay_per_tick > 0 {
+            let to_drain = self.max_replay_per_tick.min(self.repl.queue_len());
+            if to_drain > 0 {
+                processed = self.repl.replay_simple(to_drain, clients).await?;
+            }
+        }
+        Ok((health, processed))
+    }
+
+    pub async fn run_loop(&mut self, clients: &DbClients) {
+        loop {
+            match self.run_once(clients).await {
+                Ok((_health, _processed)) => {}
+                Err(e) => {
+                    println!("sync worker error: {}", e.to_message());
+                }
+            }
+            ntex::time::sleep(Duration::from_millis(self.interval_ms)).await;
+        }
     }
 }
