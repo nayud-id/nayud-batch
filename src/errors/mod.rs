@@ -11,10 +11,10 @@ pub enum AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AppError::Config(s) => write!(f, "config error: {}", s),
-            AppError::Db(s) => write!(f, "db error: {}", s),
-            AppError::Web(s) => write!(f, "web error: {}", s),
-            AppError::Other(s) => write!(f, "{}", s),
+            AppError::Config(m) => write!(f, "Config: {}", m),
+            AppError::Db(m) => write!(f, "Db: {}", m),
+            AppError::Web(m) => write!(f, "Web: {}", m),
+            AppError::Other(m) => write!(f, "Other: {}", m),
         }
     }
 }
@@ -22,3 +22,9 @@ impl fmt::Display for AppError {
 impl std::error::Error for AppError {}
 
 pub type AppResult<T> = Result<T, AppError>;
+
+impl AppError {
+    pub fn to_message(&self) -> String {
+        self.to_string()
+    }
+}
