@@ -12,6 +12,7 @@ use crate::types::ApiResponse;
 use scylla::client::session::Session;
 use scylla::statement::Consistency;
 use scylla::statement::unprepared::Statement as UnpreparedStatement;
+use scylla::value::Row;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Cluster {
@@ -528,5 +529,54 @@ impl ReplicationManager {
         }
 
         Ok(any_ok)
+    }
+
+    pub async fn read_simple(
+        &self,
+        cql: impl Into<String>,
+        consistency: Option<Consistency>,
+        clients: &DbClients,
+    ) -> AppResult<Option<(Cluster, Vec<Row>)>> {
+        let cql = cql.into();
+
+        let cl_a = consistency.unwrap_or(Consistency::LocalQuorum);
+        if let Some(sess) = clients.active.as_ref() {
+            let st = Self::build_statement(&cql, cl_a);
+            if let Ok(qr) = sess.query_unpaged(st, &[]).await {
+                if let Ok(rows_res) = qr.into_rows_result() {
+                    if let Ok(mut iter) = rows_res.rows::<Row>() {
+                        let mut rows_out = Vec::new();
+                        while let Some(item) = iter.next() {
+                            match item {
+                                Ok(row) => rows_out.push(row),
+                                Err(_) => { break; }
+                            }
+                        }
+                        return Ok(Some((Cluster::Active, rows_out)));
+                    }
+                }
+            }
+        }
+
+        let cl_p = consistency.unwrap_or(Consistency::One);
+        if let Some(sess) = clients.passive.as_ref() {
+            let st = Self::build_statement(&cql, cl_p);
+            if let Ok(qr) = sess.query_unpaged(st, &[]).await {
+                if let Ok(rows_res) = qr.into_rows_result() {
+                    if let Ok(mut iter) = rows_res.rows::<Row>() {
+                        let mut rows_out = Vec::new();
+                        while let Some(item) = iter.next() {
+                            match item {
+                                Ok(row) => rows_out.push(row),
+                                Err(_) => { break; }
+                            }
+                        }
+                        return Ok(Some((Cluster::Passive, rows_out)));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
