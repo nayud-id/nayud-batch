@@ -1,7 +1,12 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use core::future::Future;
 
 use crate::config::AppConfig;
 use crate::db::DbClients;
+use crate::errors::{AppError, AppResult};
 use crate::health::{db_health, DbHealth};
 use crate::types::ApiResponse;
 use scylla::client::session::Session;
@@ -20,6 +25,189 @@ pub trait SyncCheck: Send + Sync {
         from: Cluster,
         to: Cluster,
     ) -> bool;
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum OutboxTarget { Active, Passive, Both }
+
+#[derive(Debug, Clone)]
+pub struct OutboxRecord {
+    pub idempotency_key: String,
+    pub statement: String,
+    pub params: Vec<Vec<u8>>,
+    pub target: OutboxTarget,
+    pub created_ms: u64,
+}
+
+impl OutboxRecord {
+    pub fn new_simple(key: impl Into<String>, cql: impl Into<String>, target: OutboxTarget) -> Self {
+        Self { idempotency_key: key.into(), statement: cql.into(), params: Vec::new(), target, created_ms: 0 }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(&self.created_ms.to_le_bytes());
+        let t = match self.target { OutboxTarget::Active => 1u8, OutboxTarget::Passive => 2u8, OutboxTarget::Both => 3u8 };
+        buf.push(t);
+        let key_bytes = self.idempotency_key.as_bytes();
+        let key_len = key_bytes.len() as u16;
+        buf.extend_from_slice(&key_len.to_le_bytes());
+        buf.extend_from_slice(key_bytes);
+        let stmt_bytes = self.statement.as_bytes();
+        let stmt_len = stmt_bytes.len() as u32;
+        buf.extend_from_slice(&stmt_len.to_le_bytes());
+        buf.extend_from_slice(stmt_bytes);
+        let pcount = self.params.len() as u32;
+        buf.extend_from_slice(&pcount.to_le_bytes());
+        for p in &self.params {
+            let len = p.len() as u32;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(p);
+        }
+        buf
+    }
+
+    fn decode(mut payload: &[u8]) -> Option<Self> {
+        if payload.len() < 8 { return None; }
+        let mut ms_arr = [0u8; 8]; ms_arr.copy_from_slice(&payload[..8]);
+        let created_ms = u64::from_le_bytes(ms_arr);
+        payload = &payload[8..];
+        if payload.is_empty() { return None; }
+        let t = payload[0]; payload = &payload[1..];
+        let target = match t { 1 => OutboxTarget::Active, 2 => OutboxTarget::Passive, 3 => OutboxTarget::Both, _ => return None };
+        if payload.len() < 2 { return None; }
+        let mut klen_arr = [0u8; 2]; klen_arr.copy_from_slice(&payload[..2]);
+        let klen = u16::from_le_bytes(klen_arr) as usize; payload = &payload[2..];
+        if payload.len() < klen { return None; }
+        let key = String::from_utf8(payload[..klen].to_vec()).ok()?; payload = &payload[klen..];
+        if payload.len() < 4 { return None; }
+        let mut slen_arr = [0u8; 4]; slen_arr.copy_from_slice(&payload[..4]);
+        let slen = u32::from_le_bytes(slen_arr) as usize; payload = &payload[4..];
+        if payload.len() < slen { return None; }
+        let stmt = String::from_utf8(payload[..slen].to_vec()).ok()?; payload = &payload[slen..];
+        if payload.len() < 4 { return None; }
+        let mut pc_arr = [0u8; 4]; pc_arr.copy_from_slice(&payload[..4]);
+        let pcount = u32::from_le_bytes(pc_arr) as usize; payload = &payload[4..];
+        let mut params = Vec::with_capacity(pcount);
+        for _ in 0..pcount {
+            if payload.len() < 4 { return None; }
+            let mut len_arr = [0u8; 4]; len_arr.copy_from_slice(&payload[..4]);
+            let len = u32::from_le_bytes(len_arr) as usize; payload = &payload[4..];
+            if payload.len() < len { return None; }
+            params.push(payload[..len].to_vec());
+            payload = &payload[len..];
+        }
+        Some(OutboxRecord { idempotency_key: key, statement: stmt, params, target, created_ms })
+    }
+}
+
+const OB_MAGIC: u32 = 0x4E415944;
+const OB_VERSION: u16 = 1;
+const HEADER_LEN: usize = 4 + 2 + 4;
+
+#[derive(Debug)]
+pub struct Outbox {
+    dir: PathBuf,
+    log_path: PathBuf,
+    cursor_path: PathBuf,
+    file: File,
+    fsync: bool,
+}
+
+impl Outbox {
+    pub fn open<P: AsRef<Path>>(dir: P) -> AppResult<Self> {
+        let dir_path = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir_path).map_err(|e| AppError::other(format!("outbox create dir: {}", e)))?;
+        let log_path = dir_path.join("outbox.log");
+        let cursor_path = dir_path.join("outbox.cursor");
+        let file = OpenOptions::new().create(true).append(true).open(&log_path)
+            .map_err(|e| AppError::other(format!("outbox open log: {}", e)))?;
+        if !cursor_path.exists() {
+            std::fs::write(&cursor_path, 0u64.to_le_bytes())
+                .map_err(|e| AppError::other(format!("outbox init cursor: {}", e)))?;
+        }
+        Ok(Outbox { dir: dir_path, log_path, cursor_path, file, fsync: true })
+    }
+
+    pub fn with_fsync(mut self, fsync: bool) -> Self { self.fsync = fsync; self }
+
+    pub fn append(&mut self, mut rec: OutboxRecord) -> AppResult<u64> {
+        if rec.created_ms == 0 {
+            rec.created_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        }
+        let payload = rec.encode();
+        let payload_len = payload.len() as u32;
+        let header_len = HEADER_LEN as u64;
+        let mut end_offset = std::fs::metadata(&self.log_path).map(|m| m.len()).unwrap_or(0);
+        self.file.write_all(&OB_MAGIC.to_le_bytes())
+            .and_then(|_| self.file.write_all(&OB_VERSION.to_le_bytes()))
+            .and_then(|_| self.file.write_all(&payload_len.to_le_bytes()))
+            .and_then(|_| self.file.write_all(&payload))
+            .map_err(|e| AppError::other(format!("outbox append: {}", e)))?;
+        if self.fsync {
+            self.file.sync_data().ok();
+        }
+        end_offset += header_len + payload_len as u64;
+        Ok(end_offset)
+    }
+
+    pub fn load_cursor(&self) -> AppResult<u64> {
+        let mut buf = [0u8; 8];
+        let mut f = File::open(&self.cursor_path).map_err(|e| AppError::other(format!("cursor open: {}", e)))?;
+        f.read_exact(&mut buf).map_err(|e| AppError::other(format!("cursor read: {}", e)))?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    pub fn store_cursor(&self, offset: u64) -> AppResult<()> {
+        std::fs::write(&self.cursor_path, offset.to_le_bytes()).map_err(|e| AppError::other(format!("cursor write: {}", e)))
+    }
+
+    pub fn read_from(&self, mut offset: u64, max: usize) -> AppResult<Vec<(u64, u64, OutboxRecord)>> {
+        let mut f = OpenOptions::new().read(true).open(&self.log_path)
+            .map_err(|e| AppError::other(format!("outbox read open: {}", e)))?;
+        f.seek(SeekFrom::Start(offset)).ok();
+        let mut out = Vec::new();
+        for _ in 0..max {
+            let mut hbuf = [0u8; HEADER_LEN];
+            match f.read_exact(&mut hbuf) {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = e; break;
+                }
+            }
+            let magic = u32::from_le_bytes([hbuf[0], hbuf[1], hbuf[2], hbuf[3]]);
+            let version = u16::from_le_bytes([hbuf[4], hbuf[5]]);
+            let plen = u32::from_le_bytes([hbuf[6], hbuf[7], hbuf[8], hbuf[9]]) as usize;
+            if magic != OB_MAGIC || version != OB_VERSION { break; }
+            let mut payload = vec![0u8; plen];
+            if let Err(_) = f.read_exact(&mut payload) { break; }
+            let rec = match OutboxRecord::decode(&payload) { Some(r) => r, None => break };
+            let start = offset;
+            offset = offset + HEADER_LEN as u64 + plen as u64;
+            out.push((start, offset, rec));
+        }
+        Ok(out)
+    }
+
+    pub fn pending_count(&self) -> AppResult<usize> {
+        let mut f = OpenOptions::new().read(true).open(&self.log_path)
+            .map_err(|e| AppError::other(format!("outbox read open: {}", e)))?;
+        let mut offset = self.load_cursor()?;
+        f.seek(SeekFrom::Start(offset)).ok();
+        let mut count = 0usize;
+        loop {
+            let mut hbuf = [0u8; HEADER_LEN];
+            if f.read_exact(&mut hbuf).is_err() { break; }
+            let magic = u32::from_le_bytes([hbuf[0], hbuf[1], hbuf[2], hbuf[3]]);
+            let version = u16::from_le_bytes([hbuf[4], hbuf[5]]);
+            let plen = u32::from_le_bytes([hbuf[6], hbuf[7], hbuf[8], hbuf[9]]) as usize;
+            if magic != OB_MAGIC || version != OB_VERSION { break; }
+            if f.seek(SeekFrom::Current(plen as i64)).is_err() { break; }
+            offset += HEADER_LEN as u64 + plen as u64;
+            count += 1;
+        }
+        Ok(count)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -190,19 +378,80 @@ impl FailoverManager {
 }
 
 #[derive(Debug, Default)]
-pub struct ReplicationManager;
+pub struct ReplicationManager {
+    outbox: Option<Outbox>,
+}
 
 impl ReplicationManager {
-    pub fn new() -> Self {
-        Self
+    pub fn new() -> Self { Self { outbox: None } }
+
+    pub fn with_outbox_dir<P: AsRef<Path>>(dir: P) -> AppResult<Self> {
+        let ob = Outbox::open(dir)?;
+        Ok(Self { outbox: Some(ob) })
     }
 
-    pub fn is_active(&self) -> bool {
-        false
-    }
+    pub fn has_outbox(&self) -> bool { self.outbox.is_some() }
 
     pub fn queue_len(&self) -> usize {
-        0
+        match &self.outbox {
+            Some(ob) => ob.pending_count().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    pub fn enqueue(&mut self, rec: OutboxRecord) -> AppResult<u64> {
+        match &mut self.outbox {
+            Some(ob) => ob.append(rec),
+            None => Err(AppError::other("outbox not configured")),
+        }
+    }
+
+    pub async fn replay_with<F, Fut>(&mut self, max: usize, mut apply: F) -> AppResult<usize>
+    where
+        F: FnMut(OutboxRecord) -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let Some(ob) = self.outbox.as_mut() else { return Ok(0) };
+        let mut cursor = ob.load_cursor()?;
+        let batch = ob.read_from(cursor, max)?;
+        let mut processed = 0usize;
+        for (start, end, rec) in batch {
+            let _ = start;
+            if apply(rec).await {
+                ob.store_cursor(end)?;
+                 cursor = end;
+                 processed += 1;
+             } else {
+                 break;
+             }
+        }
+        Ok(processed)
+    }
+
+    pub async fn replay_simple(&mut self, max: usize, clients: &DbClients) -> AppResult<usize> {
+        self.replay_with(max, |rec| async move {
+            match rec.target {
+                OutboxTarget::Active => {
+                    if let Some(sess) = clients.active.as_ref() {
+                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                    } else { false }
+                }
+                OutboxTarget::Passive => {
+                    if let Some(sess) = clients.passive.as_ref() {
+                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                    } else { false }
+                }
+                OutboxTarget::Both => {
+                    let a = if let Some(sess) = clients.active.as_ref() {
+                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                    } else { false };
+                    let b = if let Some(sess) = clients.passive.as_ref() {
+                        sess.query_unpaged(rec.statement.as_str(), &[]).await.is_ok()
+                    } else { false };
+                    a && b
+                }
+            }
+        }).await
     }
 
     pub fn tick(&mut self) {}
