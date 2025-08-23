@@ -11,10 +11,20 @@ pub struct DbEndpoint {
     pub password: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DriverConfig {
+    pub request_timeout_ms: Option<u64>,
+    pub connection_timeout_ms: Option<u64>,
+    pub tcp_keepalive_secs: Option<u64>,
+    pub compression: Option<String>,
+    pub default_page_size: Option<i32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub active: DbEndpoint,
     pub passive: DbEndpoint,
+    pub driver: DriverConfig,
 }
 
 impl Default for DbEndpoint {
@@ -37,7 +47,7 @@ impl Default for AppConfig {
         let mut passive = active.clone();
         passive.port = 9043;
         passive.rack = "asia-southeast2-b".into();
-        Self { active, passive }
+        Self { active, passive, driver: DriverConfig::default() }
     }
 }
 
@@ -47,7 +57,8 @@ impl AppConfig {
         let active = DbEndpoint::from_env_with_defaults("ACTIVE_DB", Some("DB"), &defaults.active);
         let passive_defaults = defaults.passive;
         let passive = DbEndpoint::from_env_with_defaults("PASSIVE_DB", Some("DB"), &passive_defaults);
-        AppConfig { active, passive }
+        let driver = DriverConfig::from_env("DB");
+        AppConfig { active, passive, driver }
     }
 }
 
@@ -62,6 +73,17 @@ impl DbEndpoint {
             username: read_env_string(prefix, global_prefix, "USERNAME", defaults.username.clone()),
             password: read_env_string(prefix, global_prefix, "PASSWORD", defaults.password.clone()),
         }
+    }
+}
+
+impl DriverConfig {
+    pub fn from_env(global_prefix: &str) -> Self {
+        let request_timeout_ms = read_env_opt_u64(global_prefix, "REQUEST_TIMEOUT_MS");
+        let connection_timeout_ms = read_env_opt_u64(global_prefix, "CONNECTION_TIMEOUT_MS");
+        let tcp_keepalive_secs = read_env_opt_u64(global_prefix, "TCP_KEEPALIVE_SECS");
+        let compression = read_env_opt_string(global_prefix, "COMPRESSION");
+        let default_page_size = read_env_opt_i32(global_prefix, "DEFAULT_PAGE_SIZE");
+        Self { request_timeout_ms, connection_timeout_ms, tcp_keepalive_secs, compression, default_page_size }
     }
 }
 
@@ -87,4 +109,16 @@ fn read_env_u16(prefix: &str, global_prefix: Option<&str>, name: &str, default: 
         }
     }
     default
+}
+
+fn read_env_opt_u64(global_prefix: &str, name: &str) -> Option<u64> {
+    env::var(format!("{}_{}", global_prefix, name)).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
+fn read_env_opt_i32(global_prefix: &str, name: &str) -> Option<i32> {
+    env::var(format!("{}_{}", global_prefix, name)).ok().and_then(|v| v.parse::<i32>().ok())
+}
+
+fn read_env_opt_string(global_prefix: &str, name: &str) -> Option<String> {
+    env::var(format!("{}_{}", global_prefix, name)).ok()
 }
