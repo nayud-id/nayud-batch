@@ -18,7 +18,8 @@ strip = true
 env_logger = "0.11.8"
 log = "0.4.27"
 ntex = { version = "2.15.1", features = ["tokio"] }
-scylla = "1.3.1"
+openssl = "0.10.73"
+scylla = { version = "1.3.1", features = ["openssl-010"] }
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "signal"] }
 uuid = { version = "1.18.0", features = ["v4"] }

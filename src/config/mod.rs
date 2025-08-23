@@ -9,6 +9,9 @@ pub struct DbEndpoint {
     pub rack: String,
     pub username: String,
     pub password: String,
+    pub use_tls: bool,
+    pub tls_ca_file: Option<String>,
+    pub tls_insecure_skip_verify: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -37,6 +40,9 @@ impl Default for DbEndpoint {
             rack: "asia-southeast2-a".into(),
             username: "cassandra".into(),
             password: "cassandra".into(),
+            use_tls: false,
+            tls_ca_file: None,
+            tls_insecure_skip_verify: false,
         }
     }
 }
@@ -72,6 +78,9 @@ impl DbEndpoint {
             rack: read_env_string(prefix, global_prefix, "RACK", defaults.rack.clone()),
             username: read_env_string(prefix, global_prefix, "USERNAME", defaults.username.clone()),
             password: read_env_string(prefix, global_prefix, "PASSWORD", defaults.password.clone()),
+            use_tls: read_env_bool(prefix, global_prefix, "USE_TLS", defaults.use_tls),
+            tls_ca_file: read_env_opt_string_scoped(prefix, global_prefix, "TLS_CA_FILE").or_else(|| defaults.tls_ca_file.clone()),
+            tls_insecure_skip_verify: read_env_bool(prefix, global_prefix, "TLS_INSECURE_SKIP_VERIFY", defaults.tls_insecure_skip_verify),
         }
     }
 }
@@ -111,6 +120,28 @@ fn read_env_u16(prefix: &str, global_prefix: Option<&str>, name: &str, default: 
     default
 }
 
+fn read_env_bool(prefix: &str, global_prefix: Option<&str>, name: &str, default: bool) -> bool {
+    let specific = format!("{}_{}", prefix, name);
+    if let Ok(val) = env::var(&specific) {
+        if let Ok(b) = parse_bool(&val) { return b; }
+    }
+    if let Some(gp) = global_prefix {
+        let global = format!("{}_{}", gp, name);
+        if let Ok(val) = env::var(&global) {
+            if let Ok(b) = parse_bool(&val) { return b; }
+        }
+    }
+    default
+}
+
+fn parse_bool(s: &str) -> Result<bool, ()> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Ok(true),
+        "0" | "false" | "no" | "n" | "off" => Ok(false),
+        _ => Err(()),
+    }
+}
+
 fn read_env_opt_u64(global_prefix: &str, name: &str) -> Option<u64> {
     env::var(format!("{}_{}", global_prefix, name)).ok().and_then(|v| v.parse::<u64>().ok())
 }
@@ -121,4 +152,14 @@ fn read_env_opt_i32(global_prefix: &str, name: &str) -> Option<i32> {
 
 fn read_env_opt_string(global_prefix: &str, name: &str) -> Option<String> {
     env::var(format!("{}_{}", global_prefix, name)).ok()
+}
+
+fn read_env_opt_string_scoped(prefix: &str, global_prefix: Option<&str>, name: &str) -> Option<String> {
+    let specific = format!("{}_{}", prefix, name);
+    if let Ok(val) = env::var(&specific) { return Some(val); }
+    if let Some(gp) = global_prefix {
+        let global = format!("{}_{}", gp, name);
+        if let Ok(val) = env::var(&global) { return Some(val); }
+    }
+    None
 }

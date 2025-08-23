@@ -1,5 +1,4 @@
-use crate::config::{AppConfig, DbEndpoint, DriverConfig};
-use crate::errors::{AppError, AppResult};
+use openssl::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
 
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
@@ -12,6 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
+
+use crate::config::{AppConfig, DbEndpoint, DriverConfig};
+use crate::errors::{AppError, AppResult};
 
 type PreparedCache = Arc<Mutex<HashMap<String, Arc<PreparedStatement>>>>;
 
@@ -147,6 +149,26 @@ async fn connect_once(ep: &DbEndpoint, drv: &DriverConfig) -> AppResult<Session>
                 .into_handle()
         };
         builder = builder.default_execution_profile_handle(eph);
+    }
+
+    if ep.use_tls {
+        match SslContextBuilder::new(SslMethod::tls()) {
+            Ok(mut ctx_builder) => {
+                if ep.tls_insecure_skip_verify {
+                    ctx_builder.set_verify(SslVerifyMode::NONE);
+                } else {
+                    ctx_builder.set_verify(SslVerifyMode::PEER);
+                }
+                if let Some(ca_path) = ep.tls_ca_file.as_ref() {
+                    let _ = ctx_builder.set_ca_file(ca_path);
+                }
+                let ctx = ctx_builder.build();
+                builder = builder.tls_context(Some(ctx));
+            }
+            Err(e) => {
+                return Err(AppError::db(format!("failed to initialize TLS context: {}", e)));
+            }
+        }
     }
 
     let session = builder
