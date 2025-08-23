@@ -233,13 +233,6 @@ impl DefaultSyncCheck {
     pub fn with_keyspaces(active: impl Into<String>, passive: impl Into<String>) -> Self {
         Self { active_keyspace: Some(active.into()), passive_keyspace: Some(passive.into()) }
     }
-
-    async fn ping(session: &Session) -> bool {
-        session
-            .query_unpaged("SELECT release_version FROM system.local", &[])
-            .await
-            .is_ok()
-    }
 }
 
 impl SyncCheck for DefaultSyncCheck {
@@ -247,18 +240,10 @@ impl SyncCheck for DefaultSyncCheck {
         match (from, to) {
             (Cluster::Active, Cluster::Active) | (Cluster::Passive, Cluster::Passive) => true,
             (Cluster::Active, Cluster::Passive) => {
-                if let Some(sess) = clients.passive.as_ref() {
-                    Self::ping(sess).await
-                } else {
-                    false
-                }
+                clients.ping_release_version_passive().await
             }
             (Cluster::Passive, Cluster::Active) => {
-                if let Some(sess) = clients.active.as_ref() {
-                    Self::ping(sess).await
-                } else {
-                    false
-                }
+                clients.ping_release_version_active().await
             }
         }
     }
@@ -448,19 +433,20 @@ impl ReplicationManager {
         }
     }
 
-    async fn write_watermark_for(&self, sess_opt: Option<&Session>, keyspace_opt: &Option<String>, last_id: u64) -> bool {
+    async fn write_watermark_for(&self, which_active: bool, clients: &DbClients, keyspace_opt: &Option<String>, last_id: u64) -> bool {
+        let sess_opt = if which_active { clients.active.as_ref() } else { clients.passive.as_ref() };
         if let (Some(sess), Some(ks)) = (sess_opt, keyspace_opt.as_ref()) {
             let create = format!(
                 "CREATE TABLE IF NOT EXISTS {}.repl_watermark (id tinyint PRIMARY KEY, last_applied_log_id bigint, heartbeat_ms bigint)",
                 ks
             );
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-            let upsert = format!(
-                "INSERT INTO {}.repl_watermark (id, last_applied_log_id, heartbeat_ms) VALUES (0, {}, {})",
-                ks, last_id, now_ms
-            );
             let c1 = Self::exec_unpaged_session(Some(sess), &create, Consistency::One).await;
-            let c2 = Self::exec_unpaged_session(Some(sess), &upsert, Consistency::One).await;
+            let c2 = if which_active {
+                clients.upsert_watermark_active(ks, last_id, now_ms).await
+            } else {
+                clients.upsert_watermark_passive(ks, last_id, now_ms).await
+            };
             c1 && c2
         } else {
             false
@@ -469,8 +455,8 @@ impl ReplicationManager {
 
     pub async fn write_watermark_cluster(&self, cluster: Cluster, last_id: u64, clients: &DbClients) -> bool {
         match cluster {
-            Cluster::Active => self.write_watermark_for(clients.active.as_ref(), &self.active_keyspace, last_id).await,
-            Cluster::Passive => self.write_watermark_for(clients.passive.as_ref(), &self.passive_keyspace, last_id).await,
+            Cluster::Active => self.write_watermark_for(true, clients, &self.active_keyspace, last_id).await,
+            Cluster::Passive => self.write_watermark_for(false, clients, &self.passive_keyspace, last_id).await,
         }
     }
 
