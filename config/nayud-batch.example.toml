@@ -1,0 +1,35 @@
+# Copy this file to nayud-batch.toml and adjust values or set NAYUD_CONFIG_FILE to its path.
+
+[active]
+host = "127.0.0.1"
+port = 9042
+keyspace = "batch"
+datacenter = "asia-southeast2"
+rack = "asia-southeast2-a"
+username = "cassandra"
+password = "cassandra"
+use_tls = false
+# tls_ca_file = 
+tls_insecure_skip_verify = false
+
+[passive]
+host = "127.0.0.1"
+port = 9043
+keyspace = "batch"
+datacenter = "asia-southeast2"
+rack = "asia-southeast2-b"
+username = "cassandra"
+password = "cassandra"
+use_tls = false
+# tls_ca_file = 
+tls_insecure_skip_verify = false
+
+[driver]
+request_timeout_ms = 5000
+connection_timeout_ms = 10000
+tcp_keepalive_secs = 60
+compression = "snappy"
+default_page_size = 5000
+
+[server]
+bind_addr = "127.0.0.1:8080"

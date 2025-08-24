@@ -1,3 +1,7 @@
+use log::{info, warn};
+
+use ntex::rt::System;
+
 mod config;
 mod db;
 mod replication;
@@ -8,9 +12,6 @@ mod middleware;
 mod utils;
 mod web;
 
-use ntex::rt::System;
-use log::{info, warn};
-
 #[cfg(unix)]
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
@@ -19,10 +20,10 @@ async fn main() -> std::io::Result<()> {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
 
     info!("nayud-batch: initializing configuration");
-    let cfg = config::AppConfig::from_env();
+    let cfg = config::AppConfig::from_file_or_env();
 
-    let masked_user = crate::utils::mask_secret(&cfg.active.username);
-    let masked_pass = crate::utils::mask_secret(&cfg.active.password);
+    let masked_user = utils::mask_secret(&cfg.active.username);
+    let masked_pass = utils::mask_secret(&cfg.active.password);
 
     info!(
         "Active DB: {}:{} keyspace={} dc={} rack={} user={} pass={}",
@@ -30,8 +31,8 @@ async fn main() -> std::io::Result<()> {
         masked_user, masked_pass
     );
 
-    let masked_user_p = crate::utils::mask_secret(&cfg.passive.username);
-    let masked_pass_p = crate::utils::mask_secret(&cfg.passive.password);
+    let masked_user_p = utils::mask_secret(&cfg.passive.username);
+    let masked_pass_p = utils::mask_secret(&cfg.passive.password);
 
     info!(
         "Passive DB: {}:{} keyspace={} dc={} rack={} user={} pass={}",
@@ -60,7 +61,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    let bind_addr = "127.0.0.1:8080";
+    let bind_addr = cfg.server.bind_addr.clone();
     info!("Starting HTTP server on {bind_addr}");
-    web::start_server(clients, bind_addr).await
+    web::start_server(clients, &bind_addr).await
 }
