@@ -14,6 +14,8 @@ mod web;
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[ntex::main]
 async fn main() -> std::io::Result<()> {
@@ -40,10 +42,50 @@ async fn main() -> std::io::Result<()> {
         masked_user_p, masked_pass_p
     );
 
-    let clients = db::init_clients(&cfg).await.unwrap_or_else(|e| {
-        warn!("Database init error: {}. Continuing with empty clients.", e.to_message());
-        db::DbClients::default()
-    });
+    let clients = match db::init_clients(&cfg).await {
+        Ok(c) => c,
+        Err(e) => {
+            let resp = types::ApiResponse::<()>::from_error(&e);
+            let msg = match resp.message {
+                types::response::ApiMessage::Detail { what, why, how } => format!("{} | {} | {}", what, why, how),
+                _ => e.to_message(),
+            };
+            warn!("Database init error: {}", msg);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+        }
+    };
+
+    if let Err(e) = db::ensure_keyspaces(&cfg, &clients).await {
+        let resp = types::ApiResponse::<()>::from_error(&e);
+        let msg = match resp.message {
+            types::response::ApiMessage::Detail { what, why, how } => format!("{} | {} | {}", what, why, how),
+            _ => e.to_message(),
+        };
+        warn!("Keyspace ensure error: {}", msg);
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+    }
+
+    let clients_arc = Arc::new(clients);
+    let cfg_arc = Arc::new(cfg.clone());
+
+    {
+        let bg_clients = clients_arc.clone();
+        let bg_cfg = cfg_arc.clone();
+        ntex::rt::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                if let Err(e) = db::ensure_keyspaces(&*bg_cfg, &*bg_clients).await {
+                    let resp = types::ApiResponse::<()>::from_error(&e);
+                    let msg = match resp.message {
+                        types::response::ApiMessage::Detail { what, why, how } => format!("{} | {} | {}", what, why, how),
+                        _ => e.to_message(),
+                    };
+                    warn!("Periodic keyspace ensure error: {}", msg);
+                }
+            }
+        });
+    }
 
     ntex::rt::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -63,5 +105,5 @@ async fn main() -> std::io::Result<()> {
 
     let bind_addr = cfg.server.bind_addr.clone();
     info!("Starting HTTP server on {bind_addr}");
-    web::start_server(clients, &bind_addr).await
+    web::start_server(clients_arc, &bind_addr).await
 }

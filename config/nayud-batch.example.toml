@@ -11,6 +11,8 @@ password = "cassandra"
 use_tls = false
 # tls_ca_file = 
 tls_insecure_skip_verify = false
+replication_factor = 1
+durable_writes = true
 
 [passive]
 host = "127.0.0.1"
@@ -23,6 +25,8 @@ password = "cassandra"
 use_tls = false
 # tls_ca_file = 
 tls_insecure_skip_verify = false
+replication_factor = 1
+durable_writes = true
 
 [driver]
 request_timeout_ms = 5000

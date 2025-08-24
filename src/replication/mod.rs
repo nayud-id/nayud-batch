@@ -438,7 +438,7 @@ impl ReplicationManager {
         if let (Some(sess), Some(ks)) = (sess_opt, keyspace_opt.as_ref()) {
             let create = format!(
                 "CREATE TABLE IF NOT EXISTS {}.repl_watermark (id tinyint PRIMARY KEY, last_applied_log_id bigint, heartbeat_ms bigint)",
-                ks
+                crate::db::quote_ident(ks)
             );
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             let c1 = Self::exec_unpaged_session(Some(sess), &create, Consistency::One).await;

@@ -28,9 +28,9 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
        .service(health_databases);
 }
 
-pub async fn start_server(db_clients: DbClients, bind_addr: &str) -> std::io::Result<()> {
+pub async fn start_server(db_clients: Arc<DbClients>, bind_addr: &str) -> std::io::Result<()> {
     let app_state = AppState {
-        db_clients: Arc::new(db_clients),
+        db_clients,
     };
 
     web::HttpServer::new(move || {

@@ -16,6 +16,8 @@ pub struct DbEndpoint {
     pub use_tls: bool,
     pub tls_ca_file: Option<String>,
     pub tls_insecure_skip_verify: bool,
+    pub replication_factor: Option<u32>,
+    pub durable_writes: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,6 +55,8 @@ impl Default for DbEndpoint {
             use_tls: false,
             tls_ca_file: None,
             tls_insecure_skip_verify: false,
+            replication_factor: Some(3),
+            durable_writes: Some(true),
         }
     }
 }
@@ -134,6 +138,8 @@ impl DbEndpoint {
             use_tls: read_env_bool(prefix, global_prefix, "USE_TLS", defaults.use_tls),
             tls_ca_file: read_env_opt_string_scoped(prefix, global_prefix, "TLS_CA_FILE").or_else(|| defaults.tls_ca_file.clone()),
             tls_insecure_skip_verify: read_env_bool(prefix, global_prefix, "TLS_INSECURE_SKIP_VERIFY", defaults.tls_insecure_skip_verify),
+            replication_factor: defaults.replication_factor.clone(),
+            durable_writes: defaults.durable_writes.clone(),
         }
     }
 }
@@ -162,6 +168,8 @@ struct TomlDbEndpoint {
     use_tls: bool,
     tls_ca_file: Option<String>,
     tls_insecure_skip_verify: bool,
+    replication_factor: Option<u32>,
+    durable_writes: Option<bool>,
 }
 
 impl Default for TomlDbEndpoint {
@@ -181,6 +189,8 @@ macro_rules! make_endpoint {
             use_tls: $src.use_tls,
             tls_ca_file: $src.tls_ca_file,
             tls_insecure_skip_verify: $src.tls_insecure_skip_verify,
+            replication_factor: $src.replication_factor,
+            durable_writes: $src.durable_writes,
         }
     };
 }

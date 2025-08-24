@@ -5,6 +5,9 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::frame::Compression;
 use scylla::statement::prepared::PreparedStatement;
+use scylla::statement::unprepared::Statement as UnpreparedStatement;
+use scylla::statement::Consistency;
+use scylla::value::Row;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,18 +58,33 @@ impl DbClients {
         }
     }
 
-    pub async fn ping_release_version_active(&self) -> bool { self.ping_release_version(true).await }
-    pub async fn ping_release_version_passive(&self) -> bool { self.ping_release_version(false).await }
+    pub async fn ping_release_version_active(&self) -> bool {
+        self.ping_release_version(true).await
+    }
+
+    pub async fn ping_release_version_passive(&self) -> bool {
+        self.ping_release_version(false).await
+    }
 
     async fn ping_release_version(&self, which_active: bool) -> bool {
-        let cql = "SELECT release_version FROM system.local";
-        if let Some(ps) = self.get_or_prepare(which_active, cql).await {
-            let sess_opt = if which_active { self.active.as_ref() } else { self.passive.as_ref() };
-            if let Some(sess) = sess_opt {
-                return sess.execute_unpaged(&ps, &[]).await.is_ok();
+        let sess_opt = if which_active { self.active.as_ref() } else { self.passive.as_ref() };
+        let Some(sess) = sess_opt else { return false };
+        let mut st = UnpreparedStatement::new("SELECT release_version FROM system.local");
+        st.set_consistency(if which_active { Consistency::LocalQuorum } else { Consistency::One });
+        st.set_is_idempotent(true);
+        match sess.query_unpaged(st, &[]).await {
+            Ok(qr) => {
+                if let Ok(rows_res) = qr.into_rows_result() {
+                    if let Ok(mut iter) = rows_res.rows::<Row>() {
+                        if let Some(item) = iter.next() {
+                            return item.is_ok();
+                        }
+                    }
+                }
+                false
             }
+            Err(_) => false,
         }
-        false
     }
 
     pub async fn upsert_watermark_active(&self, keyspace: &str, last_id: u64, now_ms: u64) -> bool {
@@ -78,19 +96,17 @@ impl DbClients {
     }
 
     async fn upsert_watermark(&self, which_active: bool, keyspace: &str, last_id: u64, now_ms: u64) -> bool {
+        let sess_opt = if which_active { self.active.as_ref() } else { self.passive.as_ref() };
+        let Some(sess) = sess_opt else { return false };
+        let qks = quote_ident(keyspace);
         let cql = format!(
-            "INSERT INTO {}.repl_watermark (id, last_applied_log_id, heartbeat_ms) VALUES (0, ?, ?)",
-            keyspace
+            "INSERT INTO {}.repl_watermark (id, last_applied_log_id, heartbeat_ms) VALUES (1, {}, {})",
+            qks, last_id, now_ms
         );
-        if let Some(ps) = self.get_or_prepare(which_active, &cql).await {
-            let sess_opt = if which_active { self.active.as_ref() } else { self.passive.as_ref() };
-            if let Some(sess) = sess_opt {
-                let last_id_i64 = last_id as i64;
-                let now_i64 = now_ms as i64;
-                return sess.execute_unpaged(&ps, (last_id_i64, now_i64)).await.is_ok();
-            }
-        }
-        false
+        let mut st = UnpreparedStatement::new(&cql);
+        st.set_consistency(if which_active { Consistency::LocalQuorum } else { Consistency::One });
+        st.set_is_idempotent(true);
+        sess.query_unpaged(st, &[]).await.is_ok()
     }
 }
 
@@ -103,6 +119,88 @@ pub async fn init_clients(cfg: &AppConfig) -> AppResult<DbClients> {
         return Err(AppError::db("failed to connect to both Active and Passive clusters"));
     }
     Ok(DbClients { active, passive, ..DbClients::default() })
+}
+
+pub async fn ensure_keyspaces(cfg: &AppConfig, clients: &DbClients) -> AppResult<()> {
+    const ENSURE_KS_CQL_TMPL: &str = include_str!("../../cql/keyspace.cql");
+
+    let mut errors: Vec<String> = Vec::new();
+
+    let (res_active, res_passive) = tokio::join!(
+        ensure_keyspace_for_cluster(true, &cfg.active, clients, ENSURE_KS_CQL_TMPL),
+        ensure_keyspace_for_cluster(false, &cfg.passive, clients, ENSURE_KS_CQL_TMPL),
+    );
+
+    if let Err(e) = res_active { errors.push(format!("Active: {}", e.to_message())); }
+    if let Err(e) = res_passive { errors.push(format!("Passive: {}", e.to_message())); }
+
+    if errors.is_empty() { Ok(()) } else { Err(AppError::db(format!("ensure_keyspaces failed: {}", errors.join(" | ")))) }
+}
+
+async fn ensure_keyspace_for_cluster(
+    which_active: bool,
+    ep: &DbEndpoint,
+    clients: &DbClients,
+    tmpl: &str,
+) -> AppResult<()> {
+    let (sess_opt, label) = if which_active { (&clients.active, "Active") } else { (&clients.passive, "Passive") };
+    let sess = match sess_opt.as_ref() {
+        Some(s) => s,
+        None => {
+            return Err(AppError::db(format!(
+                "{} database is unavailable while ensuring keyspace '{}'.",
+                label, ep.keyspace
+            )));
+        }
+    };
+
+    let cql_check = "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?";
+    if let Some(ps) = clients.get_or_prepare(which_active, cql_check).await {
+        match sess.execute_unpaged(&ps, (&ep.keyspace,)).await {
+            Ok(qr) => {
+                if let Ok(rows_res) = qr.into_rows_result() {
+                    if let Ok(mut iter) = rows_res.rows::<Row>() {
+                        if let Some(item) = iter.next() {
+                            if item.is_ok() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(AppError::db(format!(
+                    "{}: failed to check keyspace existence for '{}': {}",
+                    label, ep.keyspace, e
+                )));
+            }
+        }
+    } else {
+        return Err(AppError::db(format!(
+            "{}: failed to prepare keyspace existence check statement.",
+            label
+        )));
+    }
+
+    let rf = ep.replication_factor.unwrap_or(1);
+    let durable = ep.durable_writes.unwrap_or(true);
+    let cql = tmpl
+        .replace("{{KEYSPACE}}", &quote_ident(&ep.keyspace))
+        .replace("{{DATACENTER}}", &ep.datacenter)
+        .replace("{{RF}}", &rf.to_string())
+        .replace("{{DURABLE_WRITES}}", if durable { "true" } else { "false" });
+
+    let mut st = UnpreparedStatement::new(&cql);
+    st.set_consistency(Consistency::Quorum);
+    st.set_is_idempotent(true);
+
+    match sess.query_unpaged(st, &[]).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(AppError::db(format!(
+            "{}: failed to create keyspace '{}': {}",
+            label, ep.keyspace, e
+        ))),
+    }
 }
 
 async fn connect_with_retries(ep: &DbEndpoint, drv: &DriverConfig, retries: usize) -> AppResult<Session> {
@@ -176,4 +274,10 @@ async fn connect_once(ep: &DbEndpoint, drv: &DriverConfig) -> AppResult<Session>
         .await
         .map_err(|e| AppError::db(format!("connect error: {}", e)))?;
     Ok(session)
+}
+
+
+pub(crate) fn quote_ident(name: &str) -> String {
+    let escaped = name.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }
